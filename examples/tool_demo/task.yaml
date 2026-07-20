@@ -1,0 +1,39 @@
+sandbox:
+  image: oneoxygen-sandbox:phase1
+  task_id: tool-demo-due-diligence
+  task_version: "1.0"
+  working_directory: /workspace
+  input_assets:
+    - source: assets/company_metrics.csv
+      destination: input/company_metrics.csv
+  output_directory: /workspace/output
+  environment_allowlist: []
+  network_policy: disabled
+  cpu_limit: 0.5
+  memory_limit_bytes: 134217728
+  pid_limit: 32
+  command_timeout_seconds: 15
+  overall_timeout_seconds: 90
+  maximum_output_size_bytes: 1048576
+tool_policy:
+  allowed_tool_names:
+    - list_files
+    - read_text_file
+    - execute_python
+    - write_text_file
+    - submit_result
+  max_total_tool_calls: 10
+  per_tool_call_limits:
+    execute_python: 1
+    submit_result: 1
+  max_read_size_bytes: 65536
+  max_write_size_bytes: 65536
+  max_file_list_entries: 100
+  shell_timeout_seconds: 5
+  python_timeout_seconds: 10
+  max_tool_result_size_bytes: 32768
+  shell_execution_allowed: false
+  python_execution_allowed: true
+  protected_workspace_paths:
+    - .oneoxygen
+    - .oneoxygen/tool-runtime

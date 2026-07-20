@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -52,6 +53,26 @@ class RunStatus(StrEnum):
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     ERROR = "error"
+
+
+class ToolErrorCode(StrEnum):
+    UNKNOWN_TOOL = "unknown_tool"
+    INVALID_ARGUMENTS = "invalid_arguments"
+    TOOL_NOT_ALLOWED = "tool_not_allowed"
+    CALL_LIMIT_EXCEEDED = "call_limit_exceeded"
+    PATH_NOT_ALLOWED = "path_not_allowed"
+    FILE_NOT_FOUND = "file_not_found"
+    BINARY_FILE = "binary_file"
+    SIZE_LIMIT_EXCEEDED = "size_limit_exceeded"
+    EXECUTION_TIMEOUT = "execution_timeout"
+    EXECUTION_FAILED = "execution_failed"
+    ALREADY_SUBMITTED = "already_submitted"
+    INTERNAL_TOOL_ERROR = "internal_tool_error"
+
+
+class ToolEventStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
 
 
 def _validate_identifier(value: str, label: str) -> str:
@@ -178,9 +199,66 @@ class SandboxSpec(StrictModel):
         return PurePosixPath(self.working_directory).relative_to("/workspace")
 
 
+class ToolPolicy(StrictModel):
+    allowed_tool_names: tuple[str, ...] = (
+        "list_files",
+        "read_text_file",
+        "write_text_file",
+        "replace_text",
+        "submit_result",
+    )
+    max_total_tool_calls: int = Field(default=50, ge=1, le=10_000)
+    per_tool_call_limits: dict[str, int] = Field(default_factory=dict)
+    max_read_size_bytes: int = Field(default=64 * 1024, ge=1, le=100 * 1024 * 1024)
+    max_write_size_bytes: int = Field(default=64 * 1024, ge=1, le=100 * 1024 * 1024)
+    max_file_list_entries: int = Field(default=200, ge=1, le=100_000)
+    shell_timeout_seconds: float = Field(default=10.0, gt=0, le=86_400)
+    python_timeout_seconds: float = Field(default=10.0, gt=0, le=86_400)
+    max_tool_result_size_bytes: int = Field(default=64 * 1024, ge=256, le=10 * 1024 * 1024)
+    shell_execution_allowed: bool = False
+    python_execution_allowed: bool = False
+    protected_workspace_paths: tuple[str, ...] = (
+        ".oneoxygen",
+        ".oneoxygen/tool-runtime",
+    )
+
+    @field_validator("allowed_tool_names")
+    @classmethod
+    def validate_allowed_tool_names(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        deduplicated: list[str] = []
+        for value in values:
+            _validate_tool_name(value)
+            if value not in deduplicated:
+                deduplicated.append(value)
+        return tuple(deduplicated)
+
+    @field_validator("per_tool_call_limits")
+    @classmethod
+    def validate_per_tool_call_limits(cls, values: dict[str, int]) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        for name, limit in values.items():
+            _validate_tool_name(name)
+            if limit < 1:
+                raise ValueError("per-tool call limits must be at least 1")
+            normalized[name] = limit
+        return dict(sorted(normalized.items()))
+
+    @field_validator("protected_workspace_paths")
+    @classmethod
+    def validate_protected_workspace_paths(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        deduplicated: list[str] = []
+        for value in values:
+            relative = _workspace_relative(value, "protected_workspace_paths", allow_root=False)
+            normalized = relative.as_posix().rstrip("/")
+            if normalized not in deduplicated:
+                deduplicated.append(normalized)
+        return tuple(deduplicated)
+
+
 class SandboxTask(StrictModel):
     sandbox: SandboxSpec
-    commands: tuple[str, ...] = Field(min_length=1, max_length=100)
+    commands: tuple[str, ...] = Field(default=(), max_length=100)
+    tool_policy: ToolPolicy = Field(default_factory=ToolPolicy)
 
     @field_validator("commands")
     @classmethod
@@ -253,9 +331,84 @@ class ArtifactMetadata(StrictModel):
     sha256: str
 
 
+class ToolDefinition(StrictModel):
+    name: str
+    description: str
+    arguments_schema: dict[str, Any]
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _validate_tool_name(value)
+
+    def to_provider_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+
+class ToolCall(StrictModel):
+    call_id: str = Field(min_length=1, max_length=128)
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("call_id")
+    @classmethod
+    def validate_call_id(cls, value: str) -> str:
+        return _validate_identifier(value, "call_id")
+
+    @field_validator("tool_name")
+    @classmethod
+    def validate_tool_name(cls, value: str) -> str:
+        return _validate_tool_name(value)
+
+
+class ToolError(StrictModel):
+    code: ToolErrorCode
+    message: str
+
+
+class ToolResult(StrictModel):
+    call_id: str
+    tool_name: str
+    success: bool
+    content: dict[str, Any] = Field(default_factory=dict)
+    error: ToolError | None = None
+    start_timestamp: datetime
+    end_timestamp: datetime
+    duration_seconds: float = Field(ge=0)
+    truncated: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SubmittedResult(StrictModel):
+    summary: str
+    artifact_paths: tuple[str, ...]
+    findings: dict[str, Any] | None = None
+    artifacts: tuple[ArtifactMetadata, ...] = ()
+
+
+class ToolEvent(StrictModel):
+    schema_version: int = 1
+    sequence_number: int = Field(ge=1)
+    call_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    arguments_sha256: str
+    arguments_truncated: bool
+    start_timestamp: datetime
+    end_timestamp: datetime
+    duration_seconds: float = Field(ge=0)
+    status: ToolEventStatus
+    result: dict[str, Any]
+    result_sha256: str
+    result_truncated: bool
+    error_code: ToolErrorCode | None = None
+
+
 class RunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    record_schema_version: int = 2
     run_id: str
     task_id: str
     task_version: str
@@ -266,6 +419,15 @@ class RunRecord(BaseModel):
     end_timestamp: datetime | None = None
     sandbox_policy: SandboxPolicy
     command_results: list[ExecResult] = Field(default_factory=list)
+    tool_policy: ToolPolicy | None = None
+    tool_events: list[ToolEvent] = Field(default_factory=list)
+    submission: SubmittedResult | None = None
     final_status: RunStatus = RunStatus.RUNNING
     error: ErrorInformation | None = None
     artifacts: list[ArtifactMetadata] = Field(default_factory=list)
+
+
+def _validate_tool_name(value: str) -> str:
+    if not re.fullmatch(r"^[a-z][a-z0-9_]{0,63}$", value):
+        raise ValueError("tool names must use lowercase letters, numbers, and underscores")
+    return value

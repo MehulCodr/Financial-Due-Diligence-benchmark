@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -32,6 +33,7 @@ from oneoxygen_sandbox.models import (
     RunStatus,
     SandboxPolicy,
     SandboxTask,
+    ToolEventStatus,
 )
 
 
@@ -94,6 +96,7 @@ class SandboxSession:
                 self.spec,
                 non_root_user=str(getattr(self.adapter, "sandbox_user", "10001:10001")),
             ),
+            tool_policy=self.task.tool_policy,
         )
         try:
             self.run_directory.mkdir(parents=True, exist_ok=False)
@@ -164,7 +167,27 @@ class SandboxSession:
                 # The foreground lifecycle retries cleanup and records any failure.
                 pass
 
+    @property
+    def is_active(self) -> bool:
+        return self._state is _SessionState.ACTIVE and not self._overall_timed_out.is_set()
+
     def execute(self, command: str) -> ExecResult:
+        result = self._execute_container_command(
+            command=command,
+            working_directory=self.spec.working_directory,
+            timeout_seconds=self.spec.command_timeout_seconds,
+        )
+        self.record.command_results.append(result)
+        return result
+
+    def execute_tool_command(
+        self, command: str, working_directory: str, timeout_seconds: float
+    ) -> ExecResult:
+        return self._execute_container_command(command, working_directory, timeout_seconds)
+
+    def _execute_container_command(
+        self, command: str, working_directory: str, timeout_seconds: float
+    ) -> ExecResult:
         if self._state is not _SessionState.ACTIVE:
             raise LifecycleError(f"cannot execute a command in state {self._state}")
         if self._overall_timed_out.is_set():
@@ -177,14 +200,14 @@ class SandboxSession:
         if remaining <= 0:
             self._expire_overall_timeout()
             raise SandboxTimeoutError("overall sandbox timeout expired")
-        timeout = min(self.spec.command_timeout_seconds, remaining)
+        timeout = min(timeout_seconds, remaining)
         execution_started_at = datetime.now(UTC)
         execution_started = time.monotonic()
         try:
             result = self.adapter.execute(
                 self.container,
                 command,
-                self.spec.working_directory,
+                working_directory,
                 timeout,
                 self.spec.maximum_output_size_bytes,
             )
@@ -203,7 +226,6 @@ class SandboxSession:
             )
         if self._overall_timed_out.is_set() and not result.timed_out:
             result = result.model_copy(update={"timed_out": True, "exit_code": 124})
-        self.record.command_results.append(result)
         if result.timed_out:
             self._container_stopped = True
             self._state = _SessionState.TERMINATED
@@ -301,7 +323,9 @@ class SandboxSession:
             )
         elif any(result.timed_out for result in self.record.command_results):
             self.record.final_status = RunStatus.TIMED_OUT
-        elif any(result.exit_code != 0 for result in self.record.command_results):
+        elif any(result.exit_code != 0 for result in self.record.command_results) or any(
+            event.status is ToolEventStatus.FAILED for event in self.record.tool_events
+        ):
             self.record.final_status = RunStatus.FAILED
         else:
             self.record.final_status = RunStatus.SUCCEEDED
@@ -311,7 +335,12 @@ class SandboxSession:
             return
         self.run_directory.mkdir(parents=True, exist_ok=True)
         temporary_path = self.run_directory / ".run.json.tmp"
-        temporary_path.write_text(self.record.model_dump_json(indent=2), encoding="utf-8")
+        serialized = json.dumps(
+            self.record.model_dump(mode="json"),
+            indent=2,
+            sort_keys=True,
+        )
+        temporary_path.write_text(f"{serialized}\n", encoding="utf-8")
         temporary_path.replace(self.record_path)
 
     def __enter__(self) -> SandboxSession:

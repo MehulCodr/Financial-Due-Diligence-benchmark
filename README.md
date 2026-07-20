@@ -1,62 +1,196 @@
-# One Oxygen Sandbox — Phase 1
+# One Oxygen Sandbox
 
-Phase 1 is a reusable local runner for real-world benchmarking tasks. It loads a validated
-YAML task, copies approved inputs into a unique temporary workspace, runs all task commands in
-one hardened Docker session, collects only approved output artifacts, writes a structured run
-record, and then removes the container and temporary workspace.
+One Oxygen is being built in phases. The repository currently implements:
 
-This phase intentionally does **not** include LLM integrations, evaluation or scoring, a
-database, a web UI, RAG, or financial-specific tools.
+- Phase 1: a hardened local Docker sandbox runner.
+- Phase 2: a provider-independent tool protocol for future LLM agent loops.
+
+There are still no model SDKs, graders, RAG, database, web UI, Kubernetes support, financial
+PDF libraries, spreadsheet libraries, or browser automation in this repo.
 
 ## Architecture
 
-The implementation uses a `src/` package layout and has four main boundaries:
+`SandboxSession` remains the Phase 1 execution boundary. It owns the run ID, temporary workspace,
+Docker container, command execution, timeouts, artifact copying, run-record persistence, and
+cleanup.
 
-- `models.py` defines immutable Pydantic configuration, execution-result, policy, artifact, and
-  run-record models. `SandboxSpec` accepts only the disabled network policy in Phase 1.
-- `filesystem.py` validates and copies inputs without following links, then validates size and
-  containment before copying approved output files.
-- `docker_adapter.py` is the only module that talks to the Docker SDK. It creates a container
-  with the required controls and verifies the resulting Docker configuration before starting it.
-- `session.py` owns one run ID, temporary workspace, container, overall watchdog, sequence of
-  command results, artifacts, record persistence, and cleanup. It supports explicit
-  `start()` / `execute()` / `collect_artifacts()` / `stop()` calls and context-manager use.
+The Phase 2 tool protocol sits above `SandboxSession`:
 
-Commands are sent to `/bin/sh -lc` as a Docker exec argument array. The host never invokes a
-shell and never interpolates a sandbox command into a host command.
+- `ToolDefinition` exposes provider-neutral JSON schemas generated from typed Pydantic argument
+  models.
+- `ToolCall` is the normalized input a future model adapter can produce.
+- `ToolDispatcher` validates calls, checks `ToolPolicy`, invokes a registered tool, normalizes
+  failures, tracks submission state, and appends bounded trace events to `RunRecord`.
+- `ToolResult` is the normalized model-facing response.
+- `SecureWorkspace` is the only filesystem view given to file tools. It accepts relative
+  `/workspace` paths, rejects traversal and symlinks, and never returns host paths.
 
-Each retained run has this shape:
+Docker-specific behavior remains inside `docker_adapter.py`. Tools do not receive the Docker
+client or arbitrary host filesystem access.
 
-```text
-runs/<run-id>/
-├── run.json
-└── artifacts/
-    └── ...approved output files only...
+## Security Model
+
+Phase 1 guarantees are preserved:
+
+- one fresh temporary workspace per run;
+- non-root numeric container user;
+- disabled networking by default;
+- read-only root filesystem;
+- only `/workspace` mounted writable;
+- in-memory hardened `/tmp`;
+- all Linux capabilities dropped;
+- `no-new-privileges`;
+- CPU, memory, PID, command, and overall runtime limits;
+- no Docker socket or repository mount;
+- no provider API keys;
+- bounded command output and artifact collection;
+- cleanup on success, failure, interruption, and timeout.
+
+Phase 2 adds:
+
+- fail-closed tool policy defaults;
+- stable machine-readable tool error codes;
+- deterministic tool schemas;
+- bounded tool arguments/results in trace records, plus SHA-256 hashes;
+- protected workspace paths such as `.oneoxygen/`;
+- atomic text writes and replacements;
+- binary-file and symlink rejection for file tools;
+- one successful `submit_result` per run;
+- post-submission tool-call rejection.
+
+Model-facing tool errors are sanitized. They do not expose host paths, stack traces, Docker
+configuration, API keys, or temporary workspace locations.
+
+## Available Tools
+
+- `list_files`: list bounded workspace entries without following symlinks.
+- `read_text_file`: read bounded UTF-8 text with optional line ranges.
+- `write_text_file`: atomically write UTF-8 text.
+- `replace_text`: atomically replace exact text only when the expected count matches.
+- `execute_shell`: run a shell command inside the active sandbox container.
+- `execute_python`: write trusted Python source to a protected runtime file, execute it inside
+  the container, then remove it.
+- `submit_result`: submit final summary, structured findings, and approved output artifacts.
+
+`execute_shell` and `execute_python` are disabled unless the task policy explicitly enables them.
+
+## Tool Policy
+
+Existing Phase 1 task YAML files still work. `tool_policy` is optional and defaults to a safe
+policy that allows file inspection/editing and submission, but not shell or Python execution.
+
+Example:
+
+```yaml
+tool_policy:
+  allowed_tool_names:
+    - list_files
+    - read_text_file
+    - execute_python
+    - write_text_file
+    - submit_result
+  max_total_tool_calls: 10
+  per_tool_call_limits:
+    execute_python: 1
+    submit_result: 1
+  max_read_size_bytes: 65536
+  max_write_size_bytes: 65536
+  max_file_list_entries: 100
+  shell_timeout_seconds: 5
+  python_timeout_seconds: 10
+  max_tool_result_size_bytes: 32768
+  shell_execution_allowed: false
+  python_execution_allowed: true
+  protected_workspace_paths:
+    - .oneoxygen
+    - .oneoxygen/tool-runtime
 ```
 
-The complete workspace is never retained or archived.
+Policies are stored in `run.json` alongside the sandbox policy and tool-event traces.
 
-## Prerequisites
+## Normalized Messages
 
-- Python 3.12
-- A Docker Engine running Linux containers
-- Docker Desktop on Windows, or Docker Engine on Linux
+Example `ToolCall`:
 
-### Windows with Docker Desktop
+```json
+{
+  "call_id": "call-3",
+  "tool_name": "execute_python",
+  "arguments": {
+    "source_code": "print('hello from the sandbox')",
+    "timeout_seconds": 5
+  }
+}
+```
 
-1. Install Docker Desktop and enable its WSL 2 backend.
-2. In Docker Desktop, select **Linux containers** (the default for WSL 2).
-3. Start Docker Desktop and wait until the engine reports that it is running.
-4. Run commands below from PowerShell. No Bash or WSL shell is required by the application.
+Example `ToolResult`:
 
-The Docker SDK uses Docker Desktop's named pipe automatically. Keep the project and `runs`
-directory on a local drive shared with Docker Desktop.
+```json
+{
+  "call_id": "call-3",
+  "tool_name": "execute_python",
+  "success": true,
+  "content": {
+    "stdout": "hello from the sandbox\n",
+    "stderr": "",
+    "exit_code": 0,
+    "duration_seconds": 0.12,
+    "timed_out": false,
+    "output_truncated": false
+  },
+  "error": null,
+  "truncated": false,
+  "metadata": {
+    "content_sha256": "..."
+  }
+}
+```
 
-### Linux
+Future model adapters should translate provider-specific tool-call formats into `ToolCall` and
+translate `ToolResult` back to that provider. The core tool layer does not import or depend on any
+provider SDK.
 
-Install Docker Engine using the instructions for your distribution. Ensure the current account
-can access the Docker daemon, for example through membership in the `docker` group, then start
-the service. Access to Docker is security-sensitive and should only be given to trusted users.
+## CLI
+
+Check Docker:
+
+```text
+python -m oneoxygen_sandbox doctor
+```
+
+Build and smoke-test the base image:
+
+```text
+python -m oneoxygen_sandbox build
+```
+
+Run the Phase 1 example:
+
+```text
+python -m oneoxygen_sandbox run examples/basic/task.yaml
+```
+
+List tools:
+
+```text
+python -m oneoxygen_sandbox tools list
+```
+
+List provider-neutral JSON definitions:
+
+```text
+python -m oneoxygen_sandbox tools list --json
+```
+
+Run the Phase 2 scripted tool demo:
+
+```text
+python -m oneoxygen_sandbox tool-demo examples/tool_demo/task.yaml
+```
+
+The demo uses `examples/tool_demo/scripted_calls.yaml` and a tiny synthetic CSV. It lists files,
+reads `company_metrics.csv`, executes standard-library Python to calculate revenue growth and
+gross margin, writes `output/findings.md`, reads it back, and submits it through `submit_result`.
 
 ## Setup
 
@@ -82,54 +216,12 @@ python -m oneoxygen_sandbox doctor
 python -m oneoxygen_sandbox build
 ```
 
-The image build uses `python:3.12.10-slim-bookworm`, installs no runtime packages, creates a
-fixed UID/GID 10001 user, and performs a post-build non-root smoke test. The image also contains
-a Docker `HEALTHCHECK`. There are no in-image dependency resolution steps.
+Docker Desktop on Windows must be running Linux containers. The application itself does not depend
+on Bash scripts.
 
-## CLI
+## Tests
 
-Check Docker:
-
-```text
-python -m oneoxygen_sandbox doctor
-```
-
-Build and smoke-test the base image:
-
-```text
-python -m oneoxygen_sandbox build
-```
-
-Run the example task:
-
-```text
-python -m oneoxygen_sandbox run examples/basic/task.yaml
-```
-
-Use a different record directory:
-
-```text
-python -m oneoxygen_sandbox run examples/basic/task.yaml --runs-dir C:\safe\sandbox-runs
-```
-
-The example's first command reads `assets/input.txt` and creates private session state. Its
-second command reads that state and writes `/workspace/output/result.txt`, proving that commands
-share one container and workspace. A failed command, timeout, policy failure, or collection
-failure produces a non-zero CLI exit status.
-
-## Task format
-
-See [`examples/basic/task.yaml`](examples/basic/task.yaml). Unknown keys are rejected. Asset
-sources are relative to the YAML file's directory and destinations must be beneath `/workspace`.
-The only Phase 1 network policy is `disabled`; requesting any other policy fails validation.
-
-`environment_allowlist` copies only names explicitly listed and present in the host environment.
-Known model-provider API-key names are rejected even if explicitly listed. Empty allowlists are
-recommended.
-
-## Tests and quality checks
-
-Run all fast tests and skip Docker integration tests explicitly:
+Run fast tests:
 
 ```text
 python -m pytest -m "not integration"
@@ -141,10 +233,11 @@ Run Docker integration tests:
 python -m pytest -m integration
 ```
 
-Integration tests skip cleanly when a compatible Docker daemon is unavailable. They build the
-image, inspect the network/read-only/CPU/memory/PID controls, check the effective user, verify
-workspace writability and root-filesystem denial, execute the example, collect its artifact, and
-confirm container removal.
+Run everything:
+
+```text
+python -m pytest
+```
 
 Format and lint:
 
@@ -153,49 +246,36 @@ python -m ruff format .
 python -m ruff check .
 ```
 
-## Security guarantees
+## Run Records
 
-For every run, the runner:
+Retained runs are written as:
 
-- creates a cryptographically random run ID and a fresh OS temporary workspace;
-- rejects unsafe task IDs, asset traversal, absolute host asset paths, and workspace escapes;
-- refuses symbolic links in task inputs and outputs and copies regular files only;
-- runs with a numeric non-root UID/GID (the calling UID/GID on Linux so its private workspace can
-  remain mode `0700`, and `10001:10001` on Docker Desktop or when the host process is root);
-- sets `NetworkMode=none` and Docker's network-disabled flag;
-- uses a read-only root filesystem and one writable bind mount at `/workspace`;
-- mounts `/tmp` as an in-memory `noexec,nosuid,nodev` tmpfs;
-- drops all Linux capabilities and enables `no-new-privileges`;
-- applies and verifies CPU, memory, and PID limits before start;
-- passes only explicitly allowlisted non-provider-secret environment variables;
-- never mounts the repository, Docker socket, or an unapproved host path;
-- bounds captured command output and collected artifacts;
-- uses per-command timeouts plus an independent overall watchdog that stops the container;
-- stops the container before artifact inspection to prevent container-side mutation races; and
-- attempts stop, forced removal, and workspace deletion on success, failure, interruption, and
-  timeout, recording cleanup failures rather than silently ignoring them.
+```text
+runs/<run-id>/
+|-- run.json
+`-- artifacts/
+    `-- ...approved output files only...
+```
 
-The Docker daemon is the trust boundary. The adapter inspects the created container and fails
-closed if Docker does not report the requested security controls.
+`run.json` includes sandbox policy, resolved tool policy, command results, tool events,
+submission metadata, final status, and copied artifact metadata. The full temporary workspace is
+not retained.
 
-## Known limitations
+## Limitations
 
-- Phase 1 supports Linux containers only. Docker Desktop may run on Windows, but must use its
-  Linux-container backend.
-- The runner is local and single-host. It is not a multi-tenant isolation service and does not
-  defend against Docker daemon or kernel vulnerabilities.
-- Arbitrary images must provide `/bin/sh` and be compatible with numeric UID/GID 10001. The
-  supplied image is the supported default.
-- Networking cannot be enabled in Phase 1. There is no domain allowlist or proxy policy.
-- Output artifact collection supports regular files and directories only; links, devices, pipes,
-  and sockets are rejected.
-- Retained run records and artifacts are not encrypted or signed. The caller is responsible for
-  protecting the chosen `runs` directory.
-- The image tag pins a Python patch release and Debian release, but not a registry digest. Teams
-  requiring bit-for-bit base-image provenance should mirror and digest-pin the base image.
+- Linux containers only.
+- Local single-host isolation, not a multi-tenant sandbox service.
+- No network access policy beyond disabled networking.
+- Tool execution requires a running `SandboxSession`.
+- `execute_python` uses Python already available in the sandbox image and no third-party
+  libraries.
+- Artifact collection still copies all approved files from the configured output directory.
+- Retained run records and artifacts are not encrypted or signed.
+- Base image provenance is tag-based; teams that need bit-for-bit provenance should mirror and
+  digest-pin the base image.
 
-## Phase 2 boundary
+## Phase 3 Preview
 
-Future work may add model-provider integration, benchmark orchestration, evaluation/scoring,
-persistence, UI/API surfaces, retrieval, and financial-specific capabilities. None of those are
-part of this implementation.
+Phase 3 can add provider adapters that convert model-specific tool calls into the normalized
+`ToolCall` format, then feed `ToolResult` objects back to the provider. That future work may also
+add benchmark orchestration and evaluation, but those are intentionally outside Phase 2.

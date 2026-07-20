@@ -1,0 +1,53 @@
+calls:
+  - call_id: call-1
+    tool_name: list_files
+    arguments:
+      path: "."
+      max_depth: 3
+  - call_id: call-2
+    tool_name: read_text_file
+    arguments:
+      path: input/company_metrics.csv
+  - call_id: call-3
+    tool_name: execute_python
+    arguments:
+      source_code: |
+        import csv
+        from pathlib import Path
+
+        rows = list(csv.DictReader(Path("/workspace/input/company_metrics.csv").open()))
+        first, last = rows[0], rows[-1]
+        revenue_growth = (
+            (float(last["revenue_usd"]) - float(first["revenue_usd"]))
+            / float(first["revenue_usd"])
+            * 100
+        )
+        gross_margin = float(last["gross_profit_usd"]) / float(last["revenue_usd"]) * 100
+        print(f"revenue_growth_percent={revenue_growth:.1f}")
+        print(f"latest_gross_margin_percent={gross_margin:.1f}")
+  - call_id: call-4
+    tool_name: write_text_file
+    arguments:
+      path: output/findings.md
+      overwrite: false
+      create_parents: true
+      content: |
+        # Synthetic Due Diligence Finding
+
+        Revenue grew 20.0% from FY2024 to FY2025.
+        Latest gross margin was 42.5%.
+        The dataset is synthetic and contains no real company or personal information.
+  - call_id: call-5
+    tool_name: read_text_file
+    arguments:
+      path: output/findings.md
+  - call_id: call-6
+    tool_name: submit_result
+    arguments:
+      summary: Synthetic metric review completed.
+      artifact_paths:
+        - output/findings.md
+      findings:
+        revenue_growth_percent: 20.0
+        latest_gross_margin_percent: 42.5
+        source: synthetic

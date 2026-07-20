@@ -53,3 +53,25 @@ class RecordPersistenceError(SandboxError):
 
 class CleanupError(SandboxError):
     code = "cleanup_error"
+
+
+class ToolFailure(SandboxError):
+    """Sanitized failure that can be returned to a model-facing tool caller."""
+
+    code = "tool_failure"
+
+    def __init__(
+        self,
+        tool_code: str,
+        message: str,
+        *,
+        content: dict | None = None,
+        metadata: dict | None = None,
+        truncated: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.tool_code = tool_code
+        self.message = message
+        self.content = content or {}
+        self.metadata = metadata or {}
+        self.truncated = truncated
