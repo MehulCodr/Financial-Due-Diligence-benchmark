@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,9 @@ class ToolDispatcher:
         session: SandboxSession,
         registry: ToolRegistry | None = None,
         policy: ToolPolicy | None = None,
+        initial_total_count: int = 0,
+        initial_tool_counts: Mapping[str, int] | None = None,
+        initial_sequence_number: int = 0,
     ) -> None:
         self.session = session
         self.registry = registry or default_tool_registry()
@@ -42,9 +46,13 @@ class ToolDispatcher:
         except SandboxError:
             submitted = False
         self.submission_state = SubmissionState(submitted=submitted)
-        self._total_count = 0
-        self._tool_counts: Counter[str] = Counter()
-        self._sequence_number = 0
+        if initial_total_count < 0 or initial_sequence_number < 0:
+            raise ValueError("initial dispatcher counters cannot be negative")
+        self._total_count = initial_total_count
+        self._tool_counts: Counter[str] = Counter(initial_tool_counts or {})
+        if any(value < 0 for value in self._tool_counts.values()):
+            raise ValueError("initial per-tool counters cannot be negative")
+        self._sequence_number = initial_sequence_number
 
     def dispatch(self, call: ToolCall) -> ToolResult:
         self._sequence_number += 1
@@ -163,6 +171,9 @@ class ToolDispatcher:
 
     def definitions(self) -> tuple[dict[str, Any], ...]:
         return tuple(definition.to_provider_dict() for definition in self.registry.definitions())
+
+    def counter_snapshot(self) -> tuple[int, dict[str, int], int]:
+        return self._total_count, dict(self._tool_counts), self._sequence_number
 
     def _workspace(self, root: Path) -> SecureWorkspace:
         return SecureWorkspace(

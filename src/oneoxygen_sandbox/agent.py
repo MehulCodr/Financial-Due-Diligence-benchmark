@@ -27,6 +27,7 @@ from oneoxygen_sandbox.models import (
     ModelTurnRequest,
     ModelTurnResponse,
     NormalizedFinishReason,
+    ProvenanceClassification,
     RunMetrics,
     RunRecord,
     RunStatus,
@@ -36,6 +37,7 @@ from oneoxygen_sandbox.models import (
     ToolErrorCode,
     ToolResult,
 )
+from oneoxygen_sandbox.orchestration import AgentRunStatus, AgentStateMachine
 from oneoxygen_sandbox.session import SandboxSession
 from oneoxygen_sandbox.tools import ToolDispatcher, ToolRegistry, default_tool_registry
 from oneoxygen_sandbox.tools.base import bounded_json_value, redact_arguments
@@ -104,6 +106,11 @@ class AgentRunner:
         self._tool_definitions: tuple[ToolDefinition, ...] = ()
         self._tool_definitions_hash = ""
         self._seen_tool_call_ids: set[str] = set()
+        self._state_machine = AgentStateMachine()
+
+    @property
+    def agent_state(self) -> AgentRunStatus:
+        return self._state_machine.status
 
     @property
     def record_path(self) -> Path | None:
@@ -129,6 +136,7 @@ class AgentRunner:
         try:
             session.start()
             self._initialize_record(session.record)
+            self._state_machine.transition(AgentRunStatus.READY_FOR_MODEL)
             dispatcher = ToolDispatcher(session, registry=self.tool_registry)
             previous_results: tuple[ToolResult, ...] = ()
             first_request = self._request(1, previous_results)
@@ -136,6 +144,8 @@ class AgentRunner:
             adapter_started = True
 
             for turn_number in range(1, self.agent_spec.maximum_model_turns + 1):
+                if self._state_machine.status is AgentRunStatus.READY_FOR_NEXT_TURN:
+                    self._state_machine.transition(AgentRunStatus.READY_FOR_MODEL)
                 if self._wall_time_exceeded():
                     outcome_status = RunStatus.LIMIT_EXCEEDED
                     outcome_reason = AgentTerminationReason.OVERALL_WALL_TIME_LIMIT_REACHED
@@ -146,11 +156,13 @@ class AgentRunner:
                     break
 
                 request = self._request(turn_number, previous_results)
+                self._state_machine.transition(AgentRunStatus.WAITING_FOR_MODEL)
                 try:
                     response, attempts, request_start, request_end = self._generate_with_retries(
                         request
                     )
                 except _AttemptFailure as failure:
+                    self._state_machine.transition(AgentRunStatus.FAILED)
                     self._record_failed_model_event(
                         turn_number,
                         failure,
@@ -182,6 +194,7 @@ class AgentRunner:
                     break
 
                 response = self._normalize_response_indexes(response, attempts)
+                self._state_machine.transition(AgentRunStatus.MODEL_RESULT_READY)
                 usage_warning = self._usage_enforcement_warning(response)
                 self._record_model_event(
                     turn_number,
@@ -258,6 +271,8 @@ class AgentRunner:
                     break
 
                 results: list[ToolResult] = []
+                if response.tool_calls:
+                    self._state_machine.transition(AgentRunStatus.EXECUTING_TOOLS)
                 wall_time_reached_during_tools = False
                 for call in response.tool_calls:
                     if wall_time_reached_during_tools or self._wall_time_exceeded():
@@ -287,6 +302,8 @@ class AgentRunner:
                     break
 
                 if dispatcher.submission_state.submitted:
+                    self._state_machine.transition(AgentRunStatus.SUBMITTED)
+                    self._state_machine.transition(AgentRunStatus.COMPLETED)
                     outcome_status = RunStatus.SUCCEEDED
                     outcome_reason = AgentTerminationReason.SUCCESSFUL_SUBMISSION
                     should_collect_submission = True
@@ -308,14 +325,17 @@ class AgentRunner:
                         is FinalTextBehavior.SUCCEED
                     ):
                         outcome_status = RunStatus.SUCCEEDED
+                        self._state_machine.transition(AgentRunStatus.COMPLETED)
                     else:
                         outcome_status = RunStatus.INCOMPLETE
+                        self._state_machine.transition(AgentRunStatus.INCOMPLETE)
                     break
 
                 if turn_number == self.agent_spec.maximum_model_turns:
                     outcome_status = RunStatus.LIMIT_EXCEEDED
                     outcome_reason = AgentTerminationReason.MAXIMUM_TURNS_REACHED
                     break
+                self._state_machine.transition(AgentRunStatus.READY_FOR_NEXT_TURN)
             else:  # pragma: no cover - the bounded range always terminates in-loop
                 outcome_status = RunStatus.LIMIT_EXCEEDED
                 outcome_reason = AgentTerminationReason.MAXIMUM_TURNS_REACHED
@@ -490,6 +510,24 @@ class AgentRunner:
     def _initialize_record(self, record: RunRecord) -> None:
         record.model_configuration = self.requested_model_config
         record.effective_model_settings = self.model_config.requested_settings()
+        record.inference_transport = self.model_config.transport
+        record.provenance = self.model_config.provenance
+        record.logical_provider = self.model_config.provider
+        record.requested_model = self.model_config.model
+        record.api_host = self.model_config.api_host
+        record.official_route = (
+            self.model_config.provenance.value == "official_provider"
+            if self.model_config.provenance is not None
+            else False
+        )
+        record.upstream_provider_verifiable = self.model_config.upstream_provider_verifiable
+        record.experiment_namespace = (
+            "gateway_unverified"
+            if self.model_config.provider.value == "airforce"
+            else "official"
+            if record.official_route
+            else "scripted_test"
+        )
         record.system_prompt_version = self.agent_spec.system_prompt_version
         record.system_prompt_sha256 = self._prompt_hash
         record.system_prompt_content = self._bounded_utf8_text(self._system_prompt, 64_000)
@@ -701,6 +739,21 @@ class AgentRunner:
                 ModelErrorCode.INVALID_PROVIDER_RESPONSE,
                 "the adapter returned a different requested model identifier",
             )
+        expected_official = (
+            self.model_config.provenance is ProvenanceClassification.OFFICIAL_PROVIDER
+        )
+        if (
+            response.transport is not self.model_config.transport
+            or response.provenance is not self.model_config.provenance
+            or response.api_host != self.model_config.api_host
+            or response.official_route is not expected_official
+            or response.upstream_provider_verifiable
+            is not self.model_config.upstream_provider_verifiable
+        ):
+            raise ModelError(
+                ModelErrorCode.INVALID_PROVIDER_RESPONSE,
+                "the adapter returned a response from a different inference route",
+            )
 
     def _normalize_response_indexes(
         self, response: ModelTurnResponse, attempts: tuple[ModelAttempt, ...]
@@ -749,8 +802,30 @@ class AgentRunner:
             response_id=response.response_id,
             warnings=warnings,
             provider_metadata=response.provider_metadata,
+            transport=response.transport or self.model_config.transport,
+            api_host=response.api_host or self.model_config.api_host or "scripted.local",
+            provenance=response.provenance or self.model_config.provenance,
+            official_route=bool(response.official_route),
+            upstream_provider_verifiable=bool(response.upstream_provider_verifiable),
+            batch_job_id=response.batch_job_id,
+            batch_request_id=response.batch_request_id,
         )
         self.session.record.model_events.append(event)
+        if (
+            event.returned_model is not None
+            and event.returned_model not in self.session.record.returned_models
+        ):
+            self.session.record.returned_models.append(event.returned_model)
+        if (
+            event.batch_job_id is not None
+            and event.batch_job_id not in self.session.record.batch_job_ids
+        ):
+            self.session.record.batch_job_ids.append(event.batch_job_id)
+        if (
+            event.batch_request_id is not None
+            and event.batch_request_id not in self.session.record.batch_request_ids
+        ):
+            self.session.record.batch_request_ids.append(event.batch_request_id)
         self.session.record.metrics = RunMetrics.aggregate(
             self.session.record.model_events,
             self.session.record.tool_events,
@@ -786,6 +861,11 @@ class AgentRunner:
             prompt_sha256=self._prompt_hash,
             error=failure.error.error,
             provider_metadata=failure.error.provider_metadata,
+            transport=self.model_config.transport,
+            api_host=self.model_config.api_host or "scripted.local",
+            provenance=self.model_config.provenance,
+            official_route=self.model_config.provenance.value == "official_provider",
+            upstream_provider_verifiable=bool(self.model_config.upstream_provider_verifiable),
         )
         self.session.record.model_events.append(event)
 

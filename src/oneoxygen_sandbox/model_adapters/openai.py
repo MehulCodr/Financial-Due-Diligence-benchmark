@@ -20,6 +20,7 @@ from typing import Any, Final, Never
 
 from oneoxygen_sandbox.errors import ModelError, sanitize_model_error_message
 from oneoxygen_sandbox.models import (
+    InferenceTransport,
     ModelCapabilities,
     ModelErrorCode,
     ModelProvider,
@@ -28,6 +29,7 @@ from oneoxygen_sandbox.models import (
     ModelTurnResponse,
     ModelUsage,
     NormalizedFinishReason,
+    ProvenanceClassification,
     ToolCall,
     ToolDefinition,
     ToolResult,
@@ -93,6 +95,12 @@ class OpenAIModelAdapter:
                 ModelErrorCode.UNSUPPORTED_PARAMETER,
                 "OpenAI provider settings are not supported in the standardized mode.",
             )
+        if config.transport is not InferenceTransport.DIRECT:
+            raise ModelError(
+                ModelErrorCode.UNSUPPORTED_PARAMETER,
+                "OpenAIModelAdapter executes only direct requests; use OpenAIBatchBackend "
+                "for provider_batch.",
+            )
         if config.tool_schema_mode is not ToolSchemaMode.PORTABLE:
             raise ModelError(
                 ModelErrorCode.UNSUPPORTED_PARAMETER,
@@ -147,7 +155,7 @@ class OpenAIModelAdapter:
 
         pending_results = [self._translate_tool_result(result) for result in request.tool_results]
         request_input = deepcopy([*self._input_items, *pending_results])
-        kwargs = self._request_arguments(request, request_input)
+        kwargs = compile_openai_responses_request(self.config, request, request_input)
 
         started_at = self._clock()
         try:
@@ -159,7 +167,8 @@ class OpenAIModelAdapter:
         latency_seconds = max(0.0, self._clock() - started_at)
 
         try:
-            normalized, serialized_output = self._normalize_response(
+            normalized, serialized_output = parse_openai_responses_response(
+                self.config,
                 response,
                 latency_seconds=latency_seconds,
             )
@@ -191,6 +200,44 @@ class OpenAIModelAdapter:
             self._input_items.clear()
             self._closed = True
             self._started = False
+
+    def export_conversation_state(self) -> dict[str, Any]:
+        """Return only serializable provider state for durable turn resumption."""
+        return {
+            "schema_version": 1,
+            "input_items": deepcopy(self._input_items),
+            "last_completed_turn": self._last_completed_turn,
+            "started": self._started,
+        }
+
+    def restore_conversation_state(self, state: Mapping[str, Any]) -> None:
+        """Restore validated state without serializing an SDK client or credentials."""
+        if self._closed or self._started:
+            raise ModelError(
+                ModelErrorCode.INTERNAL_ADAPTER_ERROR,
+                "OpenAI conversation state can only be restored into a fresh adapter.",
+            )
+        if state.get("schema_version") != 1:
+            raise ModelError(
+                ModelErrorCode.INVALID_REQUEST,
+                "unsupported OpenAI conversation-state schema",
+            )
+        input_items = _json_safe(state.get("input_items"))
+        turn = state.get("last_completed_turn")
+        if (
+            not isinstance(input_items, list)
+            or isinstance(turn, bool)
+            or not isinstance(turn, int)
+            or turn < 0
+        ):
+            raise ModelError(
+                ModelErrorCode.INVALID_REQUEST,
+                "invalid OpenAI conversation state",
+            )
+        self._ensure_client()
+        self._input_items = deepcopy(input_items)
+        self._last_completed_turn = turn
+        self._started = bool(state.get("started", True))
 
     def _validate_request_config(self, request: ModelTurnRequest) -> None:
         effective = self.validate_config(request.run_config)
@@ -256,24 +303,7 @@ class OpenAIModelAdapter:
         request: ModelTurnRequest,
         request_input: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        arguments: dict[str, Any] = {
-            "model": self.config.model,
-            "instructions": request.system_prompt,
-            "input": request_input,
-            "tools": [
-                self._translate_tool_definition(definition)
-                for definition in request.tool_definitions
-            ],
-            "max_output_tokens": self.config.maximum_output_tokens,
-            "store": self.config.store_provider_response,
-            "parallel_tool_calls": True,
-            # Required for replaying reasoning items in the default stateless mode.
-            "include": ["reasoning.encrypted_content"],
-            "timeout": request.request_timeout_seconds or self.config.model_call_timeout_seconds,
-        }
-        if self.config.temperature is not None:
-            arguments["temperature"] = self.config.temperature
-        return arguments
+        return compile_openai_responses_request(self.config, request, request_input)
 
     def _translate_tool_definition(self, definition: ToolDefinition) -> dict[str, Any]:
         return {
@@ -285,34 +315,7 @@ class OpenAIModelAdapter:
         }
 
     def _translate_tool_result(self, result: ToolResult) -> dict[str, Any]:
-        error: dict[str, Any] | None = None
-        if result.error is not None:
-            error = {
-                "code": _enum_value(result.error.code),
-                "message": sanitize_model_error_message(result.error.message)[:2_000],
-            }
-        payload: dict[str, Any] = {
-            "success": result.success,
-            "content": _json_safe(result.content),
-            "error": error,
-        }
-        encoded = _compact_json(payload)
-        if len(encoded.encode("utf-8")) > _MAX_PROVIDER_TOOL_RESULT_BYTES:
-            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-            payload = {
-                "success": result.success,
-                "content": {
-                    "truncated": True,
-                    "original_content_sha256": digest,
-                },
-                "error": error,
-            }
-            encoded = _compact_json(payload)
-        return {
-            "type": "function_call_output",
-            "call_id": result.call_id,
-            "output": encoded,
-        }
+        return translate_openai_tool_result(result)
 
     def _normalize_response(
         self,
@@ -389,6 +392,11 @@ class OpenAIModelAdapter:
                 attempt_count=1,
                 warnings=warnings,
                 provider_metadata=provider_metadata,
+                transport=self.config.transport,
+                api_host=self.config.api_host,
+                provenance=ProvenanceClassification.OFFICIAL_PROVIDER,
+                official_route=True,
+                upstream_provider_verifiable=True,
             ),
             serialized_output,
         )
@@ -581,6 +589,146 @@ class OpenAIModelAdapter:
             "The OpenAI adapter encountered an unexpected provider error.",
             provider_metadata=metadata,
         )
+
+
+def compile_openai_responses_request(
+    config: ModelRunConfig,
+    request: ModelTurnRequest,
+    request_input: list[dict[str, Any]],
+    *,
+    include_client_timeout: bool = True,
+) -> dict[str, Any]:
+    """Compile the canonical Responses body used by direct and Batch transports."""
+    if config.provider is not ModelProvider.OPENAI:
+        raise ModelError(
+            ModelErrorCode.INVALID_REQUEST,
+            "the OpenAI Responses compiler requires provider 'openai'",
+        )
+    arguments: dict[str, Any] = {
+        "model": config.model,
+        "instructions": request.system_prompt,
+        "input": deepcopy(request_input),
+        "tools": [
+            {
+                "type": "function",
+                "name": definition.name,
+                "description": definition.description,
+                "parameters": deepcopy(definition.arguments_schema),
+                "strict": False,
+            }
+            for definition in request.tool_definitions
+        ],
+        "max_output_tokens": config.maximum_output_tokens,
+        "store": config.store_provider_response,
+        "parallel_tool_calls": True,
+        "include": ["reasoning.encrypted_content"],
+    }
+    if config.temperature is not None:
+        arguments["temperature"] = config.temperature
+    if include_client_timeout:
+        arguments["timeout"] = request.request_timeout_seconds or config.model_call_timeout_seconds
+    return arguments
+
+
+def compile_openai_batch_turn(
+    config: ModelRunConfig,
+    request: ModelTurnRequest,
+    conversation_state: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Compile one batch turn and return the pending serializable state."""
+    raw_state = dict(conversation_state or {})
+    if raw_state and raw_state.get("schema_version") != 1:
+        raise ModelError(
+            ModelErrorCode.INVALID_REQUEST,
+            "unsupported OpenAI conversation-state schema",
+        )
+    prior = _json_safe(raw_state.get("input_items", []))
+    if not isinstance(prior, list):
+        raise ModelError(
+            ModelErrorCode.INVALID_REQUEST,
+            "invalid OpenAI conversation-state input items",
+        )
+    if request.turn_number == 1 and not prior:
+        prior = [{"role": "user", "content": request.initial_task_instruction}]
+    pending_results = [translate_openai_tool_result(result) for result in request.tool_results]
+    request_input = [*deepcopy(prior), *pending_results]
+    body = compile_openai_responses_request(
+        config,
+        request,
+        request_input,
+        include_client_timeout=False,
+    )
+    return body, {
+        "schema_version": 1,
+        "input_items": request_input,
+        "last_completed_turn": request.turn_number - 1,
+        "started": True,
+    }
+
+
+def apply_openai_batch_response_state(
+    pending_state: Mapping[str, Any],
+    serialized_output: list[dict[str, Any]],
+    turn_number: int,
+) -> dict[str, Any]:
+    """Advance serializable OpenAI state only after a validated batch result."""
+    prior = _json_safe(pending_state.get("input_items"))
+    output = _json_safe(serialized_output)
+    if not isinstance(prior, list) or not isinstance(output, list):
+        raise ModelError(
+            ModelErrorCode.INVALID_PROVIDER_RESPONSE,
+            "invalid OpenAI batch conversation state",
+        )
+    return {
+        "schema_version": 1,
+        "input_items": [*prior, *output],
+        "last_completed_turn": turn_number,
+        "started": True,
+    }
+
+
+def translate_openai_tool_result(result: ToolResult) -> dict[str, Any]:
+    """Translate one normalized tool result for both direct and batch continuation."""
+    error: dict[str, Any] | None = None
+    if result.error is not None:
+        error = {
+            "code": _enum_value(result.error.code),
+            "message": sanitize_model_error_message(result.error.message)[:2_000],
+        }
+    payload: dict[str, Any] = {
+        "success": result.success,
+        "content": _json_safe(result.content),
+        "error": error,
+    }
+    encoded = _compact_json(payload)
+    if len(encoded.encode("utf-8")) > _MAX_PROVIDER_TOOL_RESULT_BYTES:
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        payload = {
+            "success": result.success,
+            "content": {
+                "truncated": True,
+                "original_content_sha256": digest,
+            },
+            "error": error,
+        }
+        encoded = _compact_json(payload)
+    return {
+        "type": "function_call_output",
+        "call_id": result.call_id,
+        "output": encoded,
+    }
+
+
+def parse_openai_responses_response(
+    config: ModelRunConfig,
+    response: Any,
+    *,
+    latency_seconds: float = 0.0,
+) -> tuple[ModelTurnResponse, list[dict[str, Any]]]:
+    """Normalize a Responses result identically for direct and Batch transports."""
+    parser = object.__new__(OpenAIModelAdapter)
+    parser.config = config
+    return parser._normalize_response(response, latency_seconds=latency_seconds)
 
 
 def _read(value: Any, key: str) -> Any:

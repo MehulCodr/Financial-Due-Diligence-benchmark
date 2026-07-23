@@ -16,16 +16,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FORBIDDEN_SECRET_NAMES = {
+    "AIRFORCE_API_KEY",
     "ANTHROPIC_API_KEY",
     "AZURE_OPENAI_API_KEY",
     "COHERE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "GROQ_API_KEY",
     "MISTRAL_API_KEY",
     "OPENAI_API_KEY",
     "TOGETHER_API_KEY",
+    "XAI_API_KEY",
 }
 MODEL_PROVIDER_MARKERS = (
+    "AIRFORCE",
     "ANTHROPIC",
     "AZURE_OPENAI",
     "COHERE",
@@ -39,6 +44,7 @@ MODEL_PROVIDER_MARKERS = (
     "OPENROUTER",
     "PERPLEXITY",
     "TOGETHER",
+    "XAI",
 )
 MAXIMUM_MODEL_METADATA_BYTES = 16 * 1024
 MAXIMUM_MODEL_EVENT_TEXT_BYTES = 64 * 1024
@@ -121,6 +127,27 @@ class FinalTextBehavior(StrEnum):
 class ModelProvider(StrEnum):
     SCRIPTED = "scripted"
     OPENAI = "openai"
+    AIRFORCE = "airforce"
+
+
+class InferenceTransport(StrEnum):
+    DIRECT = "direct"
+    PROVIDER_BATCH = "provider_batch"
+    GATEWAY_DIRECT = "gateway_direct"
+
+
+class ProvenanceClassification(StrEnum):
+    OFFICIAL_PROVIDER = "official_provider"
+    THIRD_PARTY_GATEWAY_UNVERIFIED = "third_party_gateway_unverified"
+    SCRIPTED_TEST = "scripted_test"
+
+
+class DataClassification(StrEnum):
+    SYNTHETIC = "synthetic"
+    PUBLIC = "public"
+    INTERNAL = "internal"
+    CONFIDENTIAL = "confidential"
+    RESTRICTED = "restricted"
 
 
 class ToolSchemaMode(StrEnum):
@@ -157,6 +184,9 @@ class ModelErrorCode(StrEnum):
     MODEL_REFUSAL = "model_refusal"
     INTERNAL_ADAPTER_ERROR = "internal_adapter_error"
     CANCELLED = "cancelled"
+    DATA_POLICY_VIOLATION = "data_policy_violation"
+    BATCH_CORRELATION_ERROR = "batch_correlation_error"
+    REMOTE_STATE_UNKNOWN = "remote_state_unknown"
 
 
 class ToolErrorCode(StrEnum):
@@ -319,6 +349,10 @@ class ModelRunConfig(StrictModel):
     provider_settings: dict[str, Any] = Field(default_factory=dict)
     tool_schema_mode: ToolSchemaMode = ToolSchemaMode.PORTABLE
     store_provider_response: bool = False
+    transport: InferenceTransport | None = None
+    provenance: ProvenanceClassification | None = None
+    api_host: str | None = Field(default=None, min_length=1, max_length=255)
+    upstream_provider_verifiable: bool | None = None
 
     @field_validator("model")
     @classmethod
@@ -335,6 +369,59 @@ class ModelRunConfig(StrictModel):
     @classmethod
     def validate_provider_settings(cls, value: dict[str, Any]) -> dict[str, Any]:
         return _freeze_json(_validate_provider_settings(value))
+
+    @model_validator(mode="after")
+    def normalize_route(self) -> ModelRunConfig:
+        if self.provider is ModelProvider.OPENAI:
+            allowed = {InferenceTransport.DIRECT, InferenceTransport.PROVIDER_BATCH}
+            transport = self.transport or InferenceTransport.DIRECT
+            provenance = self.provenance or ProvenanceClassification.OFFICIAL_PROVIDER
+            host = self.api_host or "api.openai.com"
+            verifiable = (
+                True
+                if self.upstream_provider_verifiable is None
+                else self.upstream_provider_verifiable
+            )
+            if (
+                transport not in allowed
+                or provenance is not ProvenanceClassification.OFFICIAL_PROVIDER
+                or host != "api.openai.com"
+                or not verifiable
+            ):
+                raise ValueError("OpenAI routes must use the official api.openai.com service")
+        elif self.provider is ModelProvider.AIRFORCE:
+            transport = self.transport or InferenceTransport.GATEWAY_DIRECT
+            provenance = self.provenance or ProvenanceClassification.THIRD_PARTY_GATEWAY_UNVERIFIED
+            host = self.api_host or "api.airforce"
+            verifiable = (
+                False
+                if self.upstream_provider_verifiable is None
+                else self.upstream_provider_verifiable
+            )
+            if (
+                transport is not InferenceTransport.GATEWAY_DIRECT
+                or provenance is not ProvenanceClassification.THIRD_PARTY_GATEWAY_UNVERIFIED
+                or host != "api.airforce"
+                or verifiable
+            ):
+                raise ValueError("Airforce is restricted to its unverified gateway route")
+        else:
+            transport = self.transport or InferenceTransport.DIRECT
+            provenance = self.provenance or ProvenanceClassification.SCRIPTED_TEST
+            host = self.api_host or "scripted.local"
+            verifiable = (
+                False
+                if self.upstream_provider_verifiable is None
+                else self.upstream_provider_verifiable
+            )
+            if provenance is not ProvenanceClassification.SCRIPTED_TEST or verifiable:
+                raise ValueError("scripted runs must retain scripted-test provenance")
+
+        object.__setattr__(self, "transport", transport)
+        object.__setattr__(self, "provenance", provenance)
+        object.__setattr__(self, "api_host", host)
+        object.__setattr__(self, "upstream_provider_verifiable", verifiable)
+        return self
 
     def requested_settings(self) -> dict[str, Any]:
         """Return the sanitized, canonical settings requested for this run."""
@@ -569,6 +656,7 @@ class AgentTaskSpec(StrictModel):
     overall_wall_time_seconds: float = Field(default=600.0, gt=0, le=86_400)
     required_submission: bool = True
     final_text_without_submission: FinalTextBehavior = FinalTextBehavior.INCOMPLETE
+    data_classification: DataClassification | None = None
 
     @field_validator("instruction_file")
     @classmethod
@@ -827,6 +915,13 @@ class ModelTurnResponse(StrictModel):
     attempt_count: int = Field(default=1, ge=1)
     warnings: tuple[str, ...] = Field(default=(), max_length=100)
     provider_metadata: dict[str, Any] = Field(default_factory=dict)
+    transport: InferenceTransport | None = None
+    api_host: str | None = Field(default=None, min_length=1, max_length=255)
+    provenance: ProvenanceClassification | None = None
+    official_route: bool | None = None
+    upstream_provider_verifiable: bool | None = None
+    batch_job_id: str | None = Field(default=None, min_length=1, max_length=512)
+    batch_request_id: str | None = Field(default=None, min_length=1, max_length=512)
 
     @field_validator("warnings")
     @classmethod
@@ -845,6 +940,60 @@ class ModelTurnResponse(StrictModel):
     def validate_attempt_count(self) -> ModelTurnResponse:
         if self.attempts and self.attempt_count != len(self.attempts):
             raise ValueError("attempt_count must match the number of attempt records")
+        if self.provider is ModelProvider.OPENAI:
+            object.__setattr__(self, "transport", self.transport or InferenceTransport.DIRECT)
+            object.__setattr__(self, "api_host", self.api_host or "api.openai.com")
+            object.__setattr__(
+                self,
+                "provenance",
+                self.provenance or ProvenanceClassification.OFFICIAL_PROVIDER,
+            )
+            object.__setattr__(
+                self,
+                "upstream_provider_verifiable",
+                True
+                if self.upstream_provider_verifiable is None
+                else self.upstream_provider_verifiable,
+            )
+        elif self.provider is ModelProvider.AIRFORCE:
+            object.__setattr__(
+                self, "transport", self.transport or InferenceTransport.GATEWAY_DIRECT
+            )
+            object.__setattr__(self, "api_host", self.api_host or "api.airforce")
+            object.__setattr__(
+                self,
+                "provenance",
+                self.provenance or ProvenanceClassification.THIRD_PARTY_GATEWAY_UNVERIFIED,
+            )
+            object.__setattr__(
+                self,
+                "upstream_provider_verifiable",
+                False
+                if self.upstream_provider_verifiable is None
+                else self.upstream_provider_verifiable,
+            )
+        else:
+            object.__setattr__(self, "transport", self.transport or InferenceTransport.DIRECT)
+            object.__setattr__(self, "api_host", self.api_host or "scripted.local")
+            object.__setattr__(
+                self,
+                "provenance",
+                self.provenance or ProvenanceClassification.SCRIPTED_TEST,
+            )
+            object.__setattr__(
+                self,
+                "upstream_provider_verifiable",
+                False
+                if self.upstream_provider_verifiable is None
+                else self.upstream_provider_verifiable,
+            )
+        object.__setattr__(
+            self,
+            "official_route",
+            self.provenance is ProvenanceClassification.OFFICIAL_PROVIDER
+            if self.official_route is None
+            else self.official_route,
+        )
         return self
 
 
@@ -874,6 +1023,13 @@ class ModelEvent(StrictModel):
     warnings: tuple[str, ...] = Field(default=(), max_length=100)
     error: ModelErrorInformation | None = None
     provider_metadata: dict[str, Any] = Field(default_factory=dict)
+    transport: InferenceTransport = InferenceTransport.DIRECT
+    api_host: str = Field(default="scripted.local", min_length=1, max_length=255)
+    provenance: ProvenanceClassification = ProvenanceClassification.SCRIPTED_TEST
+    official_route: bool = False
+    upstream_provider_verifiable: bool = False
+    batch_job_id: str | None = Field(default=None, min_length=1, max_length=512)
+    batch_request_id: str | None = Field(default=None, min_length=1, max_length=512)
 
     @model_validator(mode="before")
     @classmethod
@@ -1032,6 +1188,17 @@ class RunRecord(BaseModel):
     final_status: RunStatus = RunStatus.RUNNING
     error: ErrorInformation | None = None
     artifacts: list[ArtifactMetadata] = Field(default_factory=list)
+    inference_transport: InferenceTransport | None = None
+    provenance: ProvenanceClassification | None = None
+    logical_provider: ModelProvider | None = None
+    requested_model: str | None = None
+    returned_models: list[str] = Field(default_factory=list)
+    api_host: str | None = None
+    official_route: bool | None = None
+    upstream_provider_verifiable: bool | None = None
+    experiment_namespace: str | None = None
+    batch_job_ids: list[str] = Field(default_factory=list)
+    batch_request_ids: list[str] = Field(default_factory=list)
 
 
 def _validate_tool_name(value: str) -> str:

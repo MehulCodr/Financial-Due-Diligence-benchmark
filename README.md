@@ -6,10 +6,14 @@ One Oxygen is a local, provider-neutral agent runner built in phases:
 - Phase 2 provides deterministic tools, policy enforcement, and bounded tool traces.
 - Phase 3A adds a provider-independent model contract, a deterministic agent loop, a
   network-free scripted adapter, and an optional OpenAI Responses API adapter.
+- Phase 3B adds explicit inference transports and provenance, official OpenAI Batch execution,
+  durable turn-level suspension, immutable workspace checkpoints, a deterministic mock batch
+  backend, and an experimental Api.Airforce direct gateway.
 
-Phase 3A supports only the `scripted` and `openai` model providers. It does not use an agent
-framework, the Assistants API, the OpenAI Agents SDK, hosted provider tools, RAG, graders,
-databases, streaming, a web UI, or distributed execution.
+Phase 3B implements official batch execution only for OpenAI. Anthropic, Gemini, xAI, and
+DeepSeek batch backends remain intentionally deferred. It does not use an agent framework, the
+Assistants API, the OpenAI Agents SDK, hosted provider tools, RAG, graders, a web UI, production
+cloud infrastructure, or distributed workers.
 
 ## Architecture
 
@@ -33,6 +37,10 @@ The main boundaries are:
   dependencies without importing SDKs or contacting providers during listing.
 - `AgentRunner`: enforces turns, provider requests, tokens, wall time, retries, finish states,
   artifact-selection rules, and cleanup across every runtime exit path.
+- `DurableAgentCoordinator`: persists ready turns and validated state transitions in SQLite,
+  submits compatible turns through a `BatchBackend`, and resumes each run independently.
+- `WorkspaceCheckpoint`: finalizes bounded immutable generations with a SHA-256 manifest and
+  restores a logical workspace into a new hardened container for the next tool round.
 
 The model API client and its credentials remain in the host process. Only model-requested shell
 and Python work is executed in Docker; the SDK is never installed in or passed to the sandbox.
@@ -386,6 +394,105 @@ Agent runs use distinct non-zero exit codes for invalid configuration, unavailab
 missing API keys, provider errors or refusals, incomplete runs, limit exhaustion, sandbox
 failures, cancellation, and internal errors.
 
+## Direct and Batch Inference
+
+`InferenceTransport` separates `direct`, `provider_batch`, and `gateway_direct` execution.
+`ProvenanceClassification` separately identifies `official_provider`,
+`third_party_gateway_unverified`, and `scripted_test` results. Every model event and run record
+also carries the logical provider, API host, requested and returned model, official-route flag,
+upstream-verifiability flag, and batch identifiers when applicable. Provider identity is the API
+party contacted by One Oxygen: an Airforce response remains provider `airforce` regardless of
+the model-shaped identifier returned by the gateway.
+
+Direct OpenAI calls and OpenAI Batch lines use the same Responses API compiler, output parser,
+tool-call normalization, usage mapping, finish-reason mapping, prompts, tool definitions, and
+generation settings. The transport changes only submission and retrieval. Batch JSONL targets
+`/v1/responses`, contains unique opaque `custom_id` values, never streams, and never contains an
+API key.
+
+An entire multi-turn agent cannot be submitted as one static batch request because tool results
+change its next model input. Phase 3B therefore batches one ready turn per run:
+
+1. Persist runs in `ready_for_model`.
+2. Group only matching provider, transport, model, endpoint, tool-schema hash, prompt version,
+   schema mode, effective settings, and data-policy class.
+3. Build and validate JSONL locally.
+4. Submit the batch and persist the remote ID before reporting success.
+5. Leave runs suspended in `waiting_for_model` with no live container.
+6. Download output and error files, correlate by the durable custom-ID mapping, and reject
+   duplicate or unknown IDs.
+7. Resume each successful item, execute its tool calls in a fresh sandbox, finalize a checkpoint,
+   and enqueue the next turn if needed.
+8. Complete only after `submit_result` succeeds.
+
+Successful items are never repeated. Only individually failed retryable items receive a new
+attempt ID in a later batch. A timeout or connection loss that leaves remote submission state
+unknown records `remote_state_unknown` and disables blind resubmission.
+
+### Workspace checkpoints and crash recovery
+
+Each finalized checkpoint generation contains only permitted regular workspace files plus a
+versioned SHA-256 manifest. Capture and finalization are atomic. Symbolic links, traversal,
+devices, sockets, named pipes, protected runtime/grader paths, provider credentials, and
+oversized checkpoints fail closed. Finalized generations are immutable, older generations follow
+a bounded cleanup policy, and host paths are never exposed to the model.
+
+On resume, One Oxygen verifies every file hash, restores into an empty workspace, mounts only
+that workspace into a new network-disabled container, executes tools, removes temporary runtime
+files, finalizes the next generation, then stops and removes the container. A closed terminal,
+process restart, machine restart, or long provider delay does not require a daemon: the SQLite
+revision and checkpoint generation are sufficient to continue.
+
+### OpenAI Batch CLI
+
+The commands deliberately separate local construction from external state changes:
+
+```powershell
+python -m oneoxygen_sandbox eval enqueue examples/agent_demo/task.yaml `
+  --provider openai --model "<MODEL_ID>" --transport provider_batch --count 5
+python -m oneoxygen_sandbox batch ready --provider openai
+python -m oneoxygen_sandbox batch build --provider openai
+python -m oneoxygen_sandbox batch validate "<LOCAL_BATCH_ID>"
+python -m oneoxygen_sandbox batch submit "<LOCAL_BATCH_ID>"
+python -m oneoxygen_sandbox batch status "<LOCAL_BATCH_ID>"
+python -m oneoxygen_sandbox batch collect "<LOCAL_BATCH_ID>"
+python -m oneoxygen_sandbox eval resume-ready
+python -m oneoxygen_sandbox batch cancel "<LOCAL_BATCH_ID>"
+python -m oneoxygen_sandbox batch list --unfinished
+```
+
+The official [OpenAI Batch guide](https://developers.openai.com/api/docs/guides/batch)
+documents a 50% discount versus synchronous APIs, a separate rate-limit pool, JSONL input via
+the Files API, and a 24-hour completion window. Phase 3B records this as documented capability
+metadata verified on 2026-07-23; it does not hard-code model prices or claim that every
+provider offers the same discount. Token usage and the billing transport are retained, while any
+savings estimate remains distinct from a provider invoice.
+
+### Experimental Api.Airforce gateway
+
+Api.Airforce is supported only as `gateway_direct` through its fixed HTTPS base URL
+`https://api.airforce/v1` and OpenAI-compatible Chat Completions shape. It has no batch backend.
+Its documentation describes upstream routing and failover that One Oxygen does not control, so
+every result is `third_party_gateway_unverified`, uses a separate `gateway_unverified`
+experiment/leaderboard track, and is never presented as validation of an official provider
+identity.
+
+Gateway tasks must explicitly declare `synthetic` or `public`; missing, `internal`,
+`confidential`, and `restricted` classifications return `data_policy_violation`. Calls require
+`--allow-third-party-gateway`. Only `AIRFORCE_API_KEY` is read, and no official-provider key is
+sent. See [docs/provider-risk.md](docs/provider-risk.md) for the full security policy.
+
+The free catalog is discovered live rather than hard-coded:
+
+```powershell
+python -m oneoxygen_sandbox models discover --provider airforce --free --tools `
+  --operational --allow-third-party-gateway
+```
+
+`--free` requires both reported input and output prices to be exactly zero; a badge or model-name
+suffix alone is not treated as proof. Live agentic testing also requires the caller-selected
+`ONEOXYGEN_AIRFORCE_TEST_MODEL` and skips if zero-cost tool support cannot be verified.
+
 ## Setup
 
 PowerShell:
@@ -405,6 +512,20 @@ Install OpenAI support only when needed:
 python -m pip install -e ".[dev,openai]"
 ```
 
+Host keys and explicit live-test gates in PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY = "<OPENAI_KEY>"
+$env:AIRFORCE_API_KEY = "<AIRFORCE_KEY>"
+$env:ONEOXYGEN_RUN_OPENAI_BATCH_LIVE_TESTS = "1"
+$env:ONEOXYGEN_OPENAI_BATCH_TEST_MODEL = "<MODEL_ID>"
+$env:ONEOXYGEN_RUN_AIRFORCE_LIVE_TESTS = "1"
+$env:ONEOXYGEN_AIRFORCE_TEST_MODEL = "<ZERO_COST_TOOL_MODEL_ID>"
+```
+
+Do not put keys in YAML, CLI arguments, `.env.example`, batch files, checkpoints, run records,
+or Docker. Real `.env` files remain ignored.
+
 Linux shell:
 
 ```sh
@@ -421,22 +542,23 @@ Bash scripts.
 
 ## Tests
 
-Run unit and mocked OpenAI tests with no Docker, network, or paid API call:
+Run unit, mocked OpenAI Batch, mocked Api.Airforce, and offline coordinator tests with no Docker,
+network, or paid API call:
 
 ```powershell
-python -m pytest -m "not integration and not live_api"
+python -m pytest -m "not integration and not live_api and not openai_batch_live and not airforce_live"
 ```
 
 Run Docker integration tests while explicitly excluding live API tests:
 
 ```powershell
-python -m pytest -m "integration and not live_api"
+python -m pytest -m "integration and not live_api and not openai_batch_live and not airforce_live"
 ```
 
 Run the complete local suite without live API usage:
 
 ```powershell
-python -m pytest -m "not live_api"
+python -m pytest -m "not live_api and not openai_batch_live and not airforce_live"
 ```
 
 The OpenAI adapter tests inject a mocked client and verify text, function calls, local output-item
@@ -445,6 +567,12 @@ default `store=False` plus explicit storage forwarding, disabled SDK retries, an
 They make no external request. The repository's default pytest options deselect `live_api`, so an
 ordinary `pytest` command cannot make a paid request even when live-test environment variables are
 present.
+
+The Phase 3B tests additionally cover state transitions and recovery, checkpoint restoration and
+tamper detection, grouping and custom IDs, out-of-order and partial results, missing/duplicate/
+unknown IDs, retry selection, expiry/cancellation, unknown remote state, OpenAI Files and Batch
+mock calls, `/v1/responses` shape, Airforce data policy, secret separation, malformed
+compatibility responses, missing usage, and a multi-turn offline restart demonstration.
 
 Live OpenAI testing is marked `live_api`, requires a running Linux Docker engine, warns that it
 incurs API usage, and requires all three host environment variables:
@@ -459,6 +587,14 @@ python -m pytest tests/live -m live_api
 Without an API key, the explicit `ONEOXYGEN_RUN_LIVE_TESTS=1` opt-in, and a caller-selected model
 ID, the live test skips. No current model ID is hard-coded.
 
+OpenAI Batch live submission uses the separate `openai_batch_live` marker and requires
+`OPENAI_API_KEY`, `ONEOXYGEN_RUN_OPENAI_BATCH_LIVE_TESTS=1`, and
+`ONEOXYGEN_OPENAI_BATCH_TEST_MODEL`. It can incur charges and may take up to 24 hours; the normal
+suite never waits for it. Api.Airforce live testing uses `airforce_live` and requires
+`AIRFORCE_API_KEY`, `ONEOXYGEN_RUN_AIRFORCE_LIVE_TESTS=1`,
+`ONEOXYGEN_AIRFORCE_TEST_MODEL`, explicit gateway acknowledgement in the test, and synthetic
+input. Neither marker runs by default.
+
 Format, lint, and check patch whitespace:
 
 ```powershell
@@ -470,8 +606,10 @@ git diff --check
 ## Current Limitations
 
 - Only Linux containers are supported.
-- Execution is local, synchronous, single-host, and non-streaming.
-- Only the scripted and OpenAI adapters exist in Phase 3A.
+- Coordination is local and single-host; there is no continuously running daemon or distributed
+  worker fleet.
+- Only OpenAI has an official provider-batch backend. Api.Airforce is direct-only and
+  experimental.
 - OpenAI provider-side response storage is disabled by default; an explicit
   `--store-provider-response` request is forwarded and recorded. Conversation state is still
   reconstructed locally rather than relying on `previous_response_id`.
@@ -482,14 +620,17 @@ git diff --check
 - Overall wall time is enforced at orchestration boundaries, and each OpenAI request timeout is
   reduced to the remaining wall time. Transport cancellation and scheduling can add small
   overhead after a deadline, but no later tool or provider request is started.
-- There is no cost calculation, pricing table, grading, benchmark scoring, RAG, database,
+- There is no dollar-cost calculation, pricing table, grading, benchmark scoring, RAG,
   financial-document tooling, spreadsheet tooling, browser automation, or web UI.
-- Retained run records and artifacts are not encrypted or signed.
+- SQLite state, retained run records, checkpoints, and artifacts are not encrypted or signed.
 - Base-image provenance is tag-based; deployments needing bit-for-bit provenance should mirror
   and digest-pin the image.
 
-## Phase 3B Preview
+## Deferred Provider-Batch Work
 
-Phase 3B is deferred. Its exact planned scope is additional provider adapters for Anthropic,
-Gemini, xAI, and DeepSeek using the Phase 3A contract and runner. None of those adapters is
-implemented or claimed by this repository, and Phase 3A does not begin that work.
+The next provider-batch phase will implement and test separate Anthropic Message Batches, Gemini
+Batch, and xAI Batch backends against the common `BatchBackend` contract. Their current official
+architectures differ in submission format, status model, result retrieval, and compatibility
+rules, so they will not be thin aliases for OpenAI JSONL. DeepSeek batch work remains deferred
+until an official documented architecture is selected. Phase 3B intentionally contains no
+Anthropic, Gemini, xAI, or DeepSeek batch implementation.

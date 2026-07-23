@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 
+from oneoxygen_sandbox.checkpoints import WorkspaceCheckpoint
 from oneoxygen_sandbox.config import configuration_hash
 from oneoxygen_sandbox.docker_adapter import Container, DockerAdapter, DockerSDKAdapter
 from oneoxygen_sandbox.errors import (
@@ -59,12 +60,18 @@ class SandboxSession:
         task_directory: Path,
         runs_directory: Path = Path("runs"),
         adapter: DockerAdapter | None = None,
+        checkpoint: WorkspaceCheckpoint | None = None,
+        restore_generation: int | None = None,
     ) -> None:
         self.task = task
         self.spec = task.sandbox
         self.task_directory = task_directory
         self.runs_directory = runs_directory
         self.adapter = adapter or DockerSDKAdapter()
+        if (checkpoint is None) != (restore_generation is None):
+            raise LifecycleError("checkpoint and restore_generation must be configured together")
+        self.checkpoint = checkpoint
+        self.restore_generation = restore_generation
         self.run_id = uuid.uuid4().hex
         self.run_directory = self.runs_directory / self.run_id
         self.workspace_path: Path | None = None
@@ -107,7 +114,15 @@ class SandboxSession:
             self.workspace_path = Path(
                 tempfile.mkdtemp(prefix=f"oneoxygen-{self.spec.task_id}-")
             ).resolve()
-            copy_input_assets(self.task_directory, self.workspace_path, self.spec.input_assets)
+            if self.checkpoint is not None:
+                assert self.restore_generation is not None
+                self.checkpoint.restore(self.restore_generation, self.workspace_path)
+            else:
+                copy_input_assets(
+                    self.task_directory,
+                    self.workspace_path,
+                    self.spec.input_assets,
+                )
             self.workspace_path.joinpath(*self.spec.working_relative_path.parts).mkdir(
                 parents=True, exist_ok=True
             )

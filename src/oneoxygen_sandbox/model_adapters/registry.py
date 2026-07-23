@@ -137,8 +137,15 @@ def _openai_factory(config: ModelRunConfig, **kwargs: Any) -> ModelAdapter:
     return OpenAIModelAdapter(config, **kwargs)
 
 
+def _airforce_factory(config: ModelRunConfig, **kwargs: Any) -> ModelAdapter:
+    from oneoxygen_sandbox.model_adapters.airforce import AirforceModelAdapter
+
+    return AirforceModelAdapter(config, **kwargs)
+
+
 def default_model_adapter_registry() -> ModelAdapterRegistry:
     registry = ModelAdapterRegistry()
     registry.register(ModelProvider.SCRIPTED, _scripted_factory)
     registry.register(ModelProvider.OPENAI, _openai_factory, optional_dependency="openai")
+    registry.register(ModelProvider.AIRFORCE, _airforce_factory, optional_dependency="openai")
     return registry

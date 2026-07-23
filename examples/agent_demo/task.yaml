@@ -41,6 +41,7 @@ tool_policy:
     - .oneoxygen/tool-runtime
 agent:
   instruction_file: task.md
+  data_classification: synthetic
   system_prompt_version: standard_agent_v1
   maximum_model_turns: 6
   maximum_provider_requests: 8

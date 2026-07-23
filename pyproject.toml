@@ -34,12 +34,14 @@ oneoxygen-sandbox = "oneoxygen_sandbox.cli:app"
 packages = ["src/oneoxygen_sandbox"]
 
 [tool.pytest.ini_options]
-addopts = "-ra -m 'not live_api'"
+addopts = "-ra -m 'not live_api and not openai_batch_live and not airforce_live'"
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
   "integration: tests that require a running Linux Docker engine",
   "live_api: opt-in tests that make paid external provider requests",
+  "openai_batch_live: opt-in OpenAI Batch submit tests that may incur charges and take up to 24 hours",
+  "airforce_live: opt-in Api.Airforce gateway tests restricted to synthetic data",
 ]
 
 [tool.ruff]
