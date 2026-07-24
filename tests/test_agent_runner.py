@@ -716,7 +716,7 @@ def test_browser_tools_and_exact_hosts_are_exposed_provider_neutrally(tmp_path: 
     )
 
     docker = FakeDockerAdapter()
-    if os.geteuid() != 0:
+    if os.name == "posix" and os.geteuid() != 0:
         docker.sandbox_user = f"{os.geteuid()}:{os.getegid()}"
     record, runner, docker = scripted_run(
         tmp_path,
